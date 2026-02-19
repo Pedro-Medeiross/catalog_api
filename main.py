@@ -5,6 +5,7 @@ import os
 import json
 from pathlib import Path
 from typing import Optional, Dict, Any, List
+import time
 
 from dotenv import load_dotenv
 
@@ -15,15 +16,63 @@ app = FastAPI()
 CATALOG_BASE = "https://catalog.roblox.com"
 AUTH_BASE = "https://auth.roblox.com"
 
-# onde vamos salvar o cookie em disco
+# onde vamos salvar o cookie em disco (opcional, se quiser persistir)
 COOKIE_FILE = Path("roblox_cookie.json")
 
+# se ainda quiser manter essas envs para futuro, ok
 ROBLOX_BOT_USERNAME = os.getenv("ROBLOX_BOT_USERNAME")
 ROBLOX_BOT_PASSWORD = os.getenv("ROBLOX_BOT_PASSWORD")
 
-# cache em memória do cookie da sessão atual
-_current_roblosecurity: Optional[str] = None
+# novo: cookie fixo vindo do .env
+ROBLOSECURITY_COOKIE = os.getenv("ROBLOSECURITY_COOKIE", "").strip()
+if not ROBLOSECURITY_COOKIE:
+    raise RuntimeError("ROBLOSECURITY_COOKIE não configurado no .env")
 
+# cache em memória do cookie da sessão atual (caso você queira trocar em runtime)
+_current_roblosecurity: Optional[str] = ROBLOSECURITY_COOKIE
+
+# ---------------- Rolimons ----------------
+
+ROLIMONS_URL = "https://www.rolimons.com/itemapi/itemdetails"
+
+class RolimonsCache:
+    def __init__(self, ttl_seconds: int = 600):
+        self.items: Dict[str, List[Any]] = {}
+        self.last_update: float = 0.0
+        self.ttl = ttl_seconds
+
+    async def _refresh(self):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(ROLIMONS_URL, timeout=15) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise RuntimeError(f"Falha ao puxar Rolimons: {resp.status} - {text[:200]}")
+                data = await resp.json()
+        if not data.get("success"):
+            raise RuntimeError(f"Resposta Rolimons inválida: {data}")
+        self.items = data.get("items", {})
+        self.last_update = time.time()
+
+    async def get_items(self) -> Dict[str, List[Any]]:
+        now = time.time()
+        if not self.items or now - self.last_update > self.ttl:
+            await self._refresh()
+        return self.items
+
+    async def get_limited_price(self, asset_id: int) -> Optional[int]:
+        items = await self.get_items()
+        entry = items.get(str(asset_id))
+        if not entry:
+            return None
+        # [Name, Acronym, Rap, Value, Default Value, ...] [web:484]
+        rap = entry[2] if len(entry) > 2 else None
+        if isinstance(rap, int) and rap > 0:
+            return rap
+        return None
+
+rolimons_cache = RolimonsCache(ttl_seconds=600)
+
+# ---------------- Cookie helpers (sem login automático) ----------------
 
 def load_cookie_from_disk() -> Optional[str]:
     if not COOKIE_FILE.exists():
@@ -34,79 +83,38 @@ def load_cookie_from_disk() -> Optional[str]:
     except Exception:
         return None
 
-
 def save_cookie_to_disk(cookie: str) -> None:
     data = {"ROBLOSECURITY": cookie}
     COOKIE_FILE.write_text(json.dumps(data), encoding="utf-8")
 
-
-async def login_and_get_cookie() -> str:
-    """
-    Faz login na conta bot via auth.roblox.com e retorna o .ROBLOSECURITY.
-    Usa a dança do x-csrf-token (primeiro POST falha, depois repete com header).
-    """
-    if not ROBLOX_BOT_USERNAME or not ROBLOX_BOT_PASSWORD:
-        raise RuntimeError("ROBLOX_BOT_USERNAME / ROBLOX_BOT_PASSWORD não configurados")
-
-    async with aiohttp.ClientSession() as session:
-        # 1) tentativa inicial pra pegar x-csrf-token
-        resp1 = await session.post(f"{AUTH_BASE}/v2/login")
-        csrf_token = resp1.headers.get("x-csrf-token")
-        if not csrf_token:
-            raise RuntimeError("Não consegui obter x-csrf-token do Roblox")
-
-        # 2) login real
-        headers = {
-            "x-csrf-token": csrf_token,
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "ctype": "Username",
-            "cvalue": ROBLOX_BOT_USERNAME,
-            "password": ROBLOX_BOT_PASSWORD,
-        }
-
-        resp2 = await session.post(f"{AUTH_BASE}/v2/login", json=payload, headers=headers)
-        if resp2.status >= 400:
-            text = await resp2.text()
-            raise RuntimeError(f"Falha no login Roblox: {resp2.status} - {text}")
-
-        # aiohttp session agora deve ter o cookie .ROBLOSECURITY
-        jar = session.cookie_jar
-        roblosec = None
-        for cookie in jar:
-            if cookie.key == ".ROBLOSECURITY":
-                roblosec = cookie.value
-                break
-
-        if not roblosec:
-            raise RuntimeError("Login OK mas não encontrei .ROBLOSECURITY nos cookies")
-
-        return roblosec
-
+# se quiser que o cookie do .env seja espelhado em disco:
+if _current_roblosecurity:
+    save_cookie_to_disk(_current_roblosecurity)
 
 async def ensure_cookie() -> str:
     """
-    Garante que temos um .ROBLOSECURITY válido em memória.
-    Tenta carregar de memória -> disco -> login.
+    Agora só garante que temos um .ROBLOSECURITY em memória / disco.
+    Não tenta mais logar (login quebra por challenge).
     """
     global _current_roblosecurity
 
     if _current_roblosecurity:
         return _current_roblosecurity
 
-    # tenta disco
     saved = load_cookie_from_disk()
     if saved:
         _current_roblosecurity = saved
         return _current_roblosecurity
 
-    # se não tiver, faz login
-    roblosec = await login_and_get_cookie()
-    _current_roblosecurity = roblosec
-    save_cookie_to_disk(roblosec)
-    return _current_roblosecurity
+    # fallback final: usa o do .env
+    if ROBLOSECURITY_COOKIE:
+        _current_roblosecurity = ROBLOSECURITY_COOKIE
+        save_cookie_to_disk(ROBLOSECURITY_COOKIE)
+        return _current_roblosecurity
 
+    raise RuntimeError("Nenhum .ROBLOSECURITY disponível")
+
+# ---------------- HTTP helper ----------------
 
 async def fetch_json(
     method: str,
@@ -117,7 +125,7 @@ async def fetch_json(
 ) -> Any:
     """
     Faz uma requisição HTTP simples com aiohttp e valida status.
-    Se require_auth=True e der 401/403, renova cookie e tenta 1x de novo.
+    Se require_auth=True, usa .ROBLOSECURITY fixo.
     """
     cookies = {}
 
@@ -141,33 +149,19 @@ async def fetch_json(
                 except Exception:
                     data = await resp.text()
 
-    # se precisar de auth e deu 401/403, tenta renovar cookie uma vez
-    if require_auth and status in (401, 403) and not _retry:
-        # força novo login
-        new_cookie = await login_and_get_cookie()
-        global _current_roblosecurity
-        _current_roblosecurity = new_cookie
-        save_cookie_to_disk(new_cookie)
-
-        # tenta de novo uma vez
-        return await fetch_json(
-            method,
-            url,
-            json_body=json_body,
-            require_auth=require_auth,
-            _retry=True,
-        )
-
+    # sem mais retry baseado em login; se der 401/403 você sabe que o cookie venceu
+    if status == 401 or status == 403:
+        raise HTTPException(status_code=500, detail=f"Roblox auth falhou {status}: {data}")
     if status == 404:
         raise HTTPException(status_code=404, detail=f"Not found: {url}")
     if status >= 500:
         raise HTTPException(status_code=502, detail=f"Upstream error {status} for {url}")
     if status >= 400:
-        # status 4xx genérico
         raise HTTPException(status_code=status, detail=f"Error {status} for {url}: {data}")
 
     return data
 
+# ---------------- Endpoint bundle (mantido) ----------------
 
 @app.get("/asset-to-bundle/{asset_id}")
 async def asset_to_bundle(asset_id: int):
@@ -207,6 +201,7 @@ async def asset_to_bundle(asset_id: int):
         "priceInRobux": price,
     }
 
+# ---------------- Endpoint items/details + Rolimons ----------------
 
 @app.post("/items/details")
 async def items_details(asset_ids: List[int]):
@@ -214,7 +209,9 @@ async def items_details(asset_ids: List[int]):
     Pega detalhes (incluindo preço atual / lowestPrice de limiteds) de múltiplos assets via
     POST /v1/catalog/items/details.
 
-    Aqui usamos require_auth=True porque essa rota é a que vinha dando 403.
+    Agora:
+    - Usa cookie fixo para autenticar.
+    - Para limiteds, preenche lowestPrice/priceInRobux com RAP da Rolimons se Roblox não der.
     """
     if not asset_ids:
         return []
@@ -241,15 +238,33 @@ async def items_details(asset_ids: List[int]):
     normalized = []
     for item in data:
         product = item.get("product") or {}
+
+        is_limited = bool(product.get("IsLimited") or product.get("IsLimitedUnique") or
+                          product.get("isLimited") or product.get("isLimitedUnique"))
+        price_in_robux = product.get("priceInRobux")
+        lowest_price = product.get("lowestPrice")
+
+        # se for limited e Roblox não trouxe lowestPrice, tenta Rolimons (RAP)
+        if is_limited and (not isinstance(lowest_price, int) or lowest_price <= 0):
+            try:
+                rap = await rolimons_cache.get_limited_price(item.get("id"))
+            except Exception as e:
+                print(f"[Rolimons] erro ao buscar {item.get('id')}: {e}")
+                rap = None
+
+            if rap and rap > 0:
+                lowest_price = rap
+                price_in_robux = rap
+
         normalized.append(
             {
                 "id": item.get("id"),
                 "itemType": item.get("itemType"),
                 "name": item.get("name"),
-                "priceInRobux": product.get("priceInRobux"),
-                "lowestPrice": product.get("lowestPrice"),
-                "isLimited": product.get("isLimited"),
-                "isLimitedUnique": product.get("isLimitedUnique"),
+                "priceInRobux": price_in_robux,
+                "lowestPrice": lowest_price,
+                "isLimited": is_limited,
+                "isLimitedUnique": bool(product.get("IsLimitedUnique") or product.get("isLimitedUnique")),
             }
         )
 
