@@ -31,7 +31,6 @@ CATALOG_QUEUE_NAME = "catalog_jobs"
 rabbit_connection: aio_pika.RobustConnection | None = None
 rabbit_channel: aio_pika.Channel | None = None
 
-# storage simples em memória: job_id -> resultado ou None (pendente)
 job_results: Dict[str, Any] = {}
 
 
@@ -44,7 +43,8 @@ class HTTPClient:
         base_url: str | None = None,
         max_retries: int = 3,
         backoff_base: float = 0.5,
-        max_concurrent: int = 20,
+        # CORREÇÃO 1: max_concurrent reduzido de 20 → 5 para não sobrecarregar o Roblox Catalog
+        max_concurrent: int = 5,
         request_timeout: float = 10.0,
     ):
         self.base_url = base_url.rstrip("/") if base_url else None
@@ -70,12 +70,13 @@ class HTTPClient:
             await self._session.close()
             self._session = None
 
+    # CORREÇÃO 2: _request_once agora também retorna os headers para ler Retry-After
     async def _request_once(
         self,
         method: str,
         url: str,
         json_body: Dict[str, Any] | None = None,
-    ) -> tuple[int, Any]:
+    ) -> tuple[int, Any, aiohttp.CIMultiDictProxy]:
         if self._session is None:
             raise RuntimeError("HTTPClient session not initialized")
         async with self._sem:
@@ -85,11 +86,12 @@ class HTTPClient:
                 json=json_body,
             ) as resp:
                 status = resp.status
+                headers = resp.headers
                 try:
                     data = await resp.json(content_type=None)
                 except Exception:
                     data = await resp.text()
-                return status, data
+                return status, data, headers
 
     async def request(
         self,
@@ -105,13 +107,33 @@ class HTTPClient:
 
         for attempt in range(1, self.max_retries + 1):
             try:
-                status, data = await self._request_once(method, url, json_body)
+                status, data, headers = await self._request_once(method, url, json_body)
                 last_status, last_data = status, data
 
                 if status == 404:
                     raise HTTPException(status_code=404, detail=f"Not found: {url}")
+
+                # CORREÇÃO 3: 429 agora faz retry com backoff exponencial
+                # respeitando o header Retry-After quando presente
+                if status == 429:
+                    if attempt == self.max_retries:
+                        raise HTTPException(
+                            status_code=429,
+                            detail=f"Rate limited after {self.max_retries} attempts: {url}",
+                        )
+                    retry_after = headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            delay = float(retry_after)
+                        except ValueError:
+                            delay = self.backoff_base * (2 ** (attempt - 1))
+                    else:
+                        # sem header: backoff exponencial 0.5s, 1s, 2s, 4s...
+                        delay = self.backoff_base * (2 ** (attempt - 1))
+                    await asyncio.sleep(delay)
+                    continue
+
                 if status >= 500:
-                    # tenta de novo
                     raise aiohttp.ClientResponseError(
                         request_info=None,
                         history=(),
@@ -126,6 +148,9 @@ class HTTPClient:
                     )
 
                 return data
+
+            except HTTPException:
+                raise
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 if attempt == self.max_retries:
@@ -142,18 +167,16 @@ class HTTPClient:
         )
 
 
-# instâncias globais
-catalog_client = HTTPClient(base_url=CATALOG_BASE, max_concurrent=20)
+# instâncias globais — catalog_client com max_concurrent=5 (era 20)
+catalog_client = HTTPClient(base_url=CATALOG_BASE, max_concurrent=5)
 rolimons_client = HTTPClient(max_concurrent=5)
 
 
 @app.on_event("startup")
 async def _startup():
-    # HTTP clients
     await catalog_client.startup()
     await rolimons_client.startup()
 
-    # RabbitMQ
     global rabbit_connection, rabbit_channel
     rabbit_connection = await aio_pika.connect_robust(RABBIT_URL)
     rabbit_channel = await rabbit_connection.channel()
@@ -176,7 +199,6 @@ async def _shutdown():
         await rabbit_connection.close()
 
 
-# helper compatível com seu código antigo
 async def fetch_json(
     method: str,
     url: str,
@@ -225,7 +247,6 @@ class RolimonsCache:
         entry = items.get(str(asset_id))
         if not entry:
             return None
-        # Item ID: [Name, Acronym, Rap, Value, Default Value, ...][web:69]
         rap = entry[2] if len(entry) > 2 else None
         if isinstance(rap, int) and rap > 0:
             return rap
@@ -247,11 +268,6 @@ class AssetIdsPayload(BaseModel):
 
 @app.get("/asset-to-bundle/{asset_id}")
 async def asset_to_bundle(asset_id: int):
-    """
-    Dado o assetId de QUALQUER asset (cabeça, animação, camisa, etc),
-    tenta descobrir um bundle que contenha esse asset
-    e devolve infos básicas (bundleId + preço oficial).
-    """
     bundles_data = await fetch_json(
         "GET",
         f"{CATALOG_BASE}/v1/assets/{asset_id}/bundles",
@@ -285,9 +301,6 @@ async def asset_to_bundle(asset_id: int):
 
 @app.get("/rolimons/limited-price/{asset_id}")
 async def rolimons_limited_price(asset_id: int):
-    """
-    Retorna RAP de um limited via Rolimons (ou null se não for limited / não encontrado).
-    """
     try:
         rap = await rolimons_cache.get_limited_price(asset_id)
     except HTTPException:
@@ -314,7 +327,7 @@ async def asset_to_bundle_batch_enqueue(payload: AssetIdsPayload):
         raise HTTPException(status_code=400, detail="asset_ids vazio")
 
     job_id = str(uuid4())
-    job_results[job_id] = None  # pendente
+    job_results[job_id] = None
 
     body = {
         "type": "bundle_batch",
