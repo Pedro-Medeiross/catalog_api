@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 import aio_pika
 from uuid import uuid4
+import redis.asyncio as aioredis
 
 load_dotenv()
 
@@ -28,10 +29,15 @@ RABBIT_PORT = os.getenv("RABBITMQ_PORT", "5672")
 RABBIT_URL = f"amqp://{RABBIT_USER}:{RABBIT_PASS}@{RABBIT_HOST}:{RABBIT_PORT}/"
 CATALOG_QUEUE_NAME = "catalog_jobs"
 
+# ---------------- Config Redis ----------------
+
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+JOB_TTL_SECONDS = 300  # resultado expira em 5 min
+
 rabbit_connection: aio_pika.RobustConnection | None = None
 rabbit_channel: aio_pika.Channel | None = None
-
-job_results: Dict[str, Any] = {}
+redis_client: aioredis.Redis | None = None
 
 
 # ---------------- HTTP client com retry + concorrência ----------------
@@ -43,7 +49,6 @@ class HTTPClient:
         base_url: str | None = None,
         max_retries: int = 3,
         backoff_base: float = 0.5,
-        # CORREÇÃO 1: max_concurrent reduzido de 20 → 5 para não sobrecarregar o Roblox Catalog
         max_concurrent: int = 5,
         request_timeout: float = 10.0,
     ):
@@ -70,7 +75,6 @@ class HTTPClient:
             await self._session.close()
             self._session = None
 
-    # CORREÇÃO 2: _request_once agora também retorna os headers para ler Retry-After
     async def _request_once(
         self,
         method: str,
@@ -113,8 +117,6 @@ class HTTPClient:
                 if status == 404:
                     raise HTTPException(status_code=404, detail=f"Not found: {url}")
 
-                # CORREÇÃO 3: 429 agora faz retry com backoff exponencial
-                # respeitando o header Retry-After quando presente
                 if status == 429:
                     if attempt == self.max_retries:
                         raise HTTPException(
@@ -128,7 +130,6 @@ class HTTPClient:
                         except ValueError:
                             delay = self.backoff_base * (2 ** (attempt - 1))
                     else:
-                        # sem header: backoff exponencial 0.5s, 1s, 2s, 4s...
                         delay = self.backoff_base * (2 ** (attempt - 1))
                     await asyncio.sleep(delay)
                     continue
@@ -141,6 +142,7 @@ class HTTPClient:
                         message=str(data),
                         headers=None,
                     )
+
                 if status >= 400:
                     raise HTTPException(
                         status_code=status,
@@ -167,24 +169,35 @@ class HTTPClient:
         )
 
 
-# instâncias globais — catalog_client com max_concurrent=5 (era 20)
 catalog_client = HTTPClient(base_url=CATALOG_BASE, max_concurrent=5)
 rolimons_client = HTTPClient(max_concurrent=5)
+
+# Semáforo que limita quantas requisições ao Roblox Catalog acontecem
+# simultaneamente dentro deste processo (endpoint unitário /asset-to-bundle)
+_catalog_sem = asyncio.Semaphore(3)
 
 
 @app.on_event("startup")
 async def _startup():
+    global redis_client
+
     await catalog_client.startup()
     await rolimons_client.startup()
 
+    # Redis
+    redis_client = aioredis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        decode_responses=True,
+    )
+    await redis_client.ping()
+
+    # RabbitMQ
     global rabbit_connection, rabbit_channel
     rabbit_connection = await aio_pika.connect_robust(RABBIT_URL)
     rabbit_channel = await rabbit_connection.channel()
     await rabbit_channel.set_qos(prefetch_count=50)
-    await rabbit_channel.declare_queue(
-        CATALOG_QUEUE_NAME,
-        durable=True,
-    )
+    await rabbit_channel.declare_queue(CATALOG_QUEUE_NAME, durable=True)
 
 
 @app.on_event("shutdown")
@@ -192,7 +205,9 @@ async def _shutdown():
     await catalog_client.shutdown()
     await rolimons_client.shutdown()
 
-    global rabbit_connection, rabbit_channel
+    global redis_client, rabbit_connection, rabbit_channel
+    if redis_client:
+        await redis_client.aclose()
     if rabbit_channel:
         await rabbit_channel.close()
     if rabbit_connection:
@@ -212,6 +227,36 @@ async def fetch_json(
         return await catalog_client.request(method, url, json_body)
 
 
+# ---------------- helpers Redis para job_results ----------------
+
+
+async def job_set_result(job_id: str, result: Any):
+    """Grava resultado do job no Redis com TTL."""
+    await redis_client.set(
+        f"job:{job_id}",
+        json.dumps(result),
+        ex=JOB_TTL_SECONDS,
+    )
+
+
+async def job_get_result(job_id: str) -> Any | None:
+    """Lê resultado do job do Redis. Retorna None se ainda pendente."""
+    raw = await redis_client.get(f"job:{job_id}")
+    if raw is None:
+        return None
+    return json.loads(raw)
+
+
+async def job_exists(job_id: str) -> bool:
+    """Verifica se o job_id foi criado (chave de status existe no Redis)."""
+    return bool(await redis_client.exists(f"job_status:{job_id}"))
+
+
+async def job_mark_pending(job_id: str):
+    """Marca job como pendente no Redis."""
+    await redis_client.set(f"job_status:{job_id}", "pending", ex=JOB_TTL_SECONDS)
+
+
 # ---------------- Rolimons cache ----------------
 
 
@@ -227,12 +272,9 @@ class RolimonsCache:
             now = time.time()
             if self.items and now - self.last_update <= self.ttl:
                 return
-
             data = await rolimons_client.request("GET", ROLIMONS_URL)
-
             if not data.get("success"):
                 raise RuntimeError(f"Resposta Rolimons inválida: {data}")
-
             self.items = data.get("items", {})
             self.last_update = time.time()
 
@@ -265,35 +307,56 @@ class AssetIdsPayload(BaseModel):
 
 # ---------------- Endpoint bundle (unitário) ----------------
 
+# cache em memória no processo da API para evitar bater no Roblox repetidamente
+_bundle_cache: Dict[int, Any] = {}
+
 
 @app.get("/asset-to-bundle/{asset_id}")
 async def asset_to_bundle(asset_id: int):
-    bundles_data = await fetch_json(
-        "GET",
-        f"{CATALOG_BASE}/v1/assets/{asset_id}/bundles",
-    )
+    if asset_id in _bundle_cache:
+        cached = _bundle_cache[asset_id]
+        if cached is None:
+            raise HTTPException(status_code=404, detail="No bundles for this asset")
+        return cached
 
-    bundles = bundles_data.get("data") or []
-    if not bundles:
-        raise HTTPException(status_code=404, detail="No bundles for this asset")
+    # semáforo limita concorrência de chamadas ao Roblox Catalog dentro da API
+    async with _catalog_sem:
+        # double-check após adquirir semáforo (outro request pode ter preenchido)
+        if asset_id in _bundle_cache:
+            cached = _bundle_cache[asset_id]
+            if cached is None:
+                raise HTTPException(status_code=404, detail="No bundles for this asset")
+            return cached
 
-    bundle = bundles[0]
-    bundle_id = bundle.get("id")
+        bundles_data = await fetch_json(
+            "GET",
+            f"{CATALOG_BASE}/v1/assets/{asset_id}/bundles",
+        )
 
-    details = await fetch_json(
-        "GET",
-        f"{CATALOG_BASE}/v1/bundles/{bundle_id}/details",
-    )
+        bundles = bundles_data.get("data") or []
+        if not bundles:
+            _bundle_cache[asset_id] = None
+            raise HTTPException(status_code=404, detail="No bundles for this asset")
 
-    product = details.get("product") or {}
-    price = product.get("priceInRobux")
+        bundle = bundles[0]
+        bundle_id = bundle.get("id")
 
-    return {
-        "assetId": asset_id,
-        "bundleId": bundle_id,
-        "bundleName": bundle.get("name"),
-        "priceInRobux": price,
-    }
+        details = await fetch_json(
+            "GET",
+            f"{CATALOG_BASE}/v1/bundles/{bundle_id}/details",
+        )
+
+        product = details.get("product") or {}
+        price = product.get("priceInRobux")
+
+        result = {
+            "assetId": asset_id,
+            "bundleId": bundle_id,
+            "bundleName": bundle.get("name"),
+            "priceInRobux": price,
+        }
+        _bundle_cache[asset_id] = result
+        return result
 
 
 # ---------------- Endpoint preço limited via Rolimons (unitário) ----------------
@@ -308,10 +371,7 @@ async def rolimons_limited_price(asset_id: int):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Erro ao consultar Rolimons: {e}")
 
-    return {
-        "assetId": asset_id,
-        "rap": rap,
-    }
+    return {"assetId": asset_id, "rap": rap}
 
 
 # ---------------- Endpoints batch com RabbitMQ (enqueue) ----------------
@@ -327,7 +387,7 @@ async def asset_to_bundle_batch_enqueue(payload: AssetIdsPayload):
         raise HTTPException(status_code=400, detail="asset_ids vazio")
 
     job_id = str(uuid4())
-    job_results[job_id] = None
+    await job_mark_pending(job_id)
 
     body = {
         "type": "bundle_batch",
@@ -357,7 +417,7 @@ async def rolimons_limited_price_batch_enqueue(payload: AssetIdsPayload):
         raise HTTPException(status_code=400, detail="asset_ids vazio")
 
     job_id = str(uuid4())
-    job_results[job_id] = None
+    await job_mark_pending(job_id)
 
     body = {
         "type": "rap_batch",
@@ -382,10 +442,10 @@ async def rolimons_limited_price_batch_enqueue(payload: AssetIdsPayload):
 
 @app.get("/catalog/job-result/{job_id}")
 async def get_catalog_job_result(job_id: str):
-    if job_id not in job_results:
+    if not await job_exists(job_id):
         raise HTTPException(status_code=404, detail="job_id desconhecido")
 
-    result = job_results[job_id]
+    result = await job_get_result(job_id)
     if result is None:
         return {"status": "pending"}
 
